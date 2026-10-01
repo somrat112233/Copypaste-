@@ -1,27 +1,3 @@
-bash <<'COPYSETUP_EOF'
-set -e
-
-echo "════════════════════════════════════════════"
-echo "   copypaste  —  Updating to v1.1 (Timeout Fix)"
-echo "════════════════════════════════════════════"
-
-# ---------- 1. Stop old instance & clean ----------
-pkill -f agent.py 2>/dev/null || true
-sleep 1
-
-# ---------- 2. Folder setup ----------
-mkdir -p "$HOME/copypaste/repos"
-cd "$HOME/copypaste"
-
-# ---------- 3. agent.py ----------
-echo "📝 Writing updated agent.py ..."
-cat > agent.py <<'PYEOF'
-#!/usr/bin/env python3
-"""
-copypaste — Autonomous Coding Agent (Telegram bot for Termux)
-Version: 1.1 (Python 3.14 asyncio fix + Clone Timeout fix)
-"""
-
 import os, re, ast, json, shutil, difflib, logging, subprocess
 import asyncio
 from pathlib import Path
@@ -543,38 +519,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PYEOF
-
-# ---------- 4. run.sh ----------
-cat > run.sh <<'RUNEOF'
-#!/data/data/com.termux/files/usr/bin/bash
-termux-wake-lock 2>/dev/null || true
-cd "$HOME/copypaste"
-if [ -z "$BOT_TOKEN" ]; then
-  echo "❌ BOT_TOKEN set koro age:  export BOT_TOKEN='xxxxx'"
-  exit 1
-fi
-nohup python agent.py > agent.log 2>&1 &
-echo "✅ copypaste started. PID: $!"
-echo "   Log  : tail -f ~/copypaste/agent.log"
-echo "   Stop : pkill -f agent.py"
-RUNEOF
-chmod +x run.sh
-
-echo ""
-echo "════════════════════════════════════════════"
-echo "   ✅  copypaste v1.1 installed!"
-echo "════════════════════════════════════════════"
-echo ""
-echo "  📁  $HOME/copypaste/"
-echo "  📄  $HOME/copypaste/agent.py"
-echo "  🚀  $HOME/copypaste/run.sh"
-echo ""
-echo "  👉  Ekhon ei 2 ta line chalao:"
-echo ""
-echo '      export BOT_TOKEN="TOKEN_BOSHAO"'
-echo '      ~/copypaste/run.sh'
-echo ""
-echo "════════════════════════════════════════════"
-
-COPYSETUP_EOF
