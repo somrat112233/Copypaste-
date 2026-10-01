@@ -1,25 +1,50 @@
-"""Telegram handlers: /copy <github_url> -> inspection -> interactive file browser."""
+"""Telegram handlers: main menu, input form, GitHub inspection, interactive file browser."""
 import asyncio
 import html
 import logging
+import re
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from config import ALLOWED_USER_IDS, PAGE_SIZE
-from github.client import GitHubError, inspect_repository
+from github.client import GitHubError, inspect_repository, parse_github_url
 
 log = logging.getLogger(__name__)
 SESSION_KEY = "copy_session"
+FORM_KEY = "copy_form"
+HTML = ParseMode.HTML
+
+MENU_TEXT = "🏠 <b>CopyPaste</b>\nChoose an action:"
+HELP_TEXT = (
+    "ℹ️ <b>Help</b>\n\n"
+    "1. Press <b>New Copy</b>\n"
+    "2. Tap the URL field and send a GitHub link\n"
+    "3. Optionally set a branch\n"
+    "4. Press <b>OK</b> and pick your files\n\n"
+    "Shortcuts: /start opens this menu, /copy opens the form."
+)
 
 
+# ----------------------------------------------------------------- helpers
 def _allowed(update: Update) -> bool:
     if not ALLOWED_USER_IDS:
         return True
     user = update.effective_user
     return bool(user and user.id in ALLOWED_USER_IDS)
+
+
+def _btn(label: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(label, callback_data=data)
 
 
 def _fmt_size(n: int) -> str:
@@ -35,195 +60,217 @@ def _short(name: str, limit: int = 34) -> str:
     return name if len(name) <= limit else name[: limit - 1] + "…"
 
 
-def _listing(session: dict):
-    """Directories and files directly inside the current folder."""
-    cwd = session["cwd"]
-    prefix = cwd + "/" if cwd else ""
-    dirs, files = set(), []
-    for i, entry in enumerate(session["inspection"].files):
-        if not entry.path.startswith(prefix):
-            continue
-        rest = entry.path[len(prefix):]
-        if "/" in rest:
-            dirs.add(rest.split("/", 1)[0])
-        else:
-            files.append(i)
-    files.sort(key=lambda i: session["inspection"].files[i].path.lower())
-    return sorted(dirs, key=str.lower), files
-
-
-def _render(session: dict):
-    insp = session["inspection"]
-    dirs, files = _listing(session)
-    view = [("dir", d) for d in dirs] + [("file", i) for i in files]
-    session["view"] = view
-
-    pages = max(1, -(-len(view) // PAGE_SIZE))
-    session["page"] = max(0, min(session["page"], pages - 1))
-    page = session["page"]
-    chunk = list(enumerate(view))[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
-
-    location = "/" + session["cwd"] if session["cwd"] else "/"
-    text = (
-        f"📦 <b>{html.escape(insp.full_name)}</b>"
-        f"{' 🔒' if insp.private else ''}\n"
-        f"🌿 Branch: <code>{html.escape(insp.branch)}</code>"
-        f"{'' if insp.branch != insp.default_branch else ' (default)'}\n"
-        f"📄 {len(insp.files)} files · {_fmt_size(insp.total_size)}\n"
-        f"📍 <code>{html.escape(location)}</code> · page {page + 1}/{pages}\n"
-        f"✅ Selected: {len(session['selected'])}"
-    )
-    if insp.truncated:
-        text += "\n⚠️ GitHub truncated the tree (very large repo); some files may be missing."
-
-    rows = []
-    for view_idx, (kind, value) in chunk:
-        if kind == "dir":
-            rows.append([InlineKeyboardButton(f"📁 {_short(value)}", callback_data=f"cp:nav:{view_idx}")])
-        else:
-            entry = insp.files[value]
-            name = entry.path.rsplit("/", 1)[-1]
-            mark = "✅" if value in session["selected"] else "⬜"
-            rows.append([InlineKeyboardButton(
-                f"{mark} {_short(name, 28)} ({_fmt_size(entry.size)})",
-                callback_data=f"cp:sel:{value}",
-            )])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"cp:pg:{page - 1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"cp:pg:{page + 1}"))
-    if nav:
-        rows.append(nav)
-
-    tools = []
-    if session["cwd"]:
-        tools.append(InlineKeyboardButton("⬆️ Up", callback_data="cp:up:0"))
-    if files:
-        tools.append(InlineKeyboardButton("☑️ All here", callback_data="cp:all:0"))
-        tools.append(InlineKeyboardButton("🧹 Clear here", callback_data="cp:none:0"))
-    if tools:
-        rows.append(tools)
-
-    rows.append([
-        InlineKeyboardButton(f"✅ Done ({len(session['selected'])})", callback_data="cp:done:0"),
-        InlineKeyboardButton("❌ Cancel", callback_data="cp:cancel:0"),
-    ])
-    return text, InlineKeyboardMarkup(rows)
-
-
-async def copy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed(update):
-        await update.message.reply_text("⛔ You are not allowed to use this bot.")
-        return
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: <code>/copy &lt;github_url&gt;</code>\n"
-            "Example: <code>/copy https://github.com/owner/repo</code>\n"
-            "Branch/folder URLs work too: <code>.../tree/dev/src</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    url = context.args[0]
-    status = await update.message.reply_text("🔎 Inspecting repository…")
+async def _edit(query_or_bot, text, markup=None, chat_id=None, message_id=None):
+    """Edit a message, ignoring Telegram's 'message is not modified' error."""
     try:
-        insp = await asyncio.to_thread(inspect_repository, url)
-    except GitHubError as exc:
-        await status.edit_text(f"❌ {exc}")
-        return
-    except Exception:
-        log.exception("Unexpected error inspecting %s", url)
-        await status.edit_text("❌ Unexpected error while inspecting the repository.")
-        return
-
-    if not insp.files:
-        await status.edit_text("📭 That repository has no files on this branch.")
-        return
-
-    session = {
-        "inspection": insp,
-        "cwd": insp.start_path,
-        "page": 0,
-        "selected": set(),
-        "view": [],
-    }
-    context.user_data[SESSION_KEY] = session
-    text, markup = _render(session)
-    await status.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
-
-
-async def copy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not _allowed(update):
-        await query.answer("Not allowed.", show_alert=True)
-        return
-
-    session = context.user_data.get(SESSION_KEY)
-    if not session:
-        await query.answer("Session expired. Run /copy again.", show_alert=True)
-        return
-
-    try:
-        _, action, arg = query.data.split(":", 2)
-        arg_i = int(arg)
-    except ValueError:
-        await query.answer()
-        return
-
-    insp = session["inspection"]
-
-    if action == "nav":
-        kind, value = session["view"][arg_i]
-        if kind == "dir":
-            session["cwd"] = f"{session['cwd']}/{value}" if session["cwd"] else value
-            session["page"] = 0
-    elif action == "up":
-        session["cwd"] = session["cwd"].rsplit("/", 1)[0] if "/" in session["cwd"] else ""
-        session["page"] = 0
-    elif action == "pg":
-        session["page"] = arg_i
-    elif action == "sel":
-        session["selected"] ^= {arg_i}
-    elif action in ("all", "none"):
-        _, files = _listing(session)
-        if action == "all":
-            session["selected"] |= set(files)
+        if chat_id is None:
+            await query_or_bot.edit_message_text(text, reply_markup=markup, parse_mode=HTML)
         else:
-            session["selected"] -= set(files)
-    elif action == "cancel":
-        context.user_data.pop(SESSION_KEY, None)
-        await query.answer()
-        await query.edit_message_text("🚫 Copy cancelled.")
-        return
-    elif action == "done":
-        if not session["selected"]:
-            await query.answer("Select at least one file first.", show_alert=True)
-            return
-        chosen = [insp.files[i] for i in sorted(session["selected"], key=lambda i: insp.files[i].path)]
-        session["chosen"] = chosen
-        listing = "\n".join(f"• <code>{html.escape(f.path)}</code> ({_fmt_size(f.size)})" for f in chosen[:40])
-        if len(chosen) > 40:
-            listing += f"\n… and {len(chosen) - 40} more"
-        await query.answer()
-        await query.edit_message_text(
-            f"✅ <b>{len(chosen)} file(s) selected</b> from "
-            f"<code>{html.escape(insp.full_name)}@{html.escape(insp.branch)}</code>\n\n{listing}\n\n"
-            "➡️ Next step: Destination Select (coming in the next feature).",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    await query.answer()
-    text, markup = _render(session)
-    try:
-        await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+            await query_or_bot.edit_message_text(
+                text, chat_id=chat_id, message_id=message_id, reply_markup=markup, parse_mode=HTML
+            )
     except BadRequest as exc:
         if "not modified" not in str(exc).lower():
             raise
 
 
-def register_handlers(app: Application) -> None:
-    app.add_handler(CommandHandler("copy", copy_command))
-    app.add_handler(CallbackQueryHandler(copy_callback, pattern=r"^cp:"))
+async def _safe_delete(bot, chat_id, message_id) -> None:
+    if not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+# -------------------------------------------------------------- main menu
+def _menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_btn("📥 New Copy", "menu:new")],
+        [_btn("ℹ️ Help", "menu:help")],
+    ])
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        await update.message.reply_text("⛔ You are not allowed to use this bot.")
+        return
+    await update.message.reply_text(MENU_TEXT, reply_markup=_menu_markup(), parse_mode=HTML)
+
+
+# ------------------------------------------------------------------- form
+def _form_view(form: dict, notice: str = ""):
+    url, branch = form["url"], form["branch"]
+    url_line = f"<code>{html.escape(url)}</code>" if url else "<i>not set</i>"
+    branch_line = f"<code>{html.escape(branch)}</code>" if branch else "<i>auto (default branch)</i>"
+    text = (
+        "📝 <b>New Copy</b>\n"
+        "Tap a field to fill it in, then press OK.\n\n"
+        f"🔗 GitHub URL: {url_line}\n"
+        f"🌿 Branch: {branch_line}"
+    )
+    if notice:
+        text += f"\n\n{notice}"
+
+    rows = [
+        [_btn(f"🔗 URL: {_short(url, 28) if url else 'tap to set'}", "form:url")],
+        [_btn(f"🌿 Branch: {_short(branch, 24) if branch else 'auto'}", "form:branch")],
+    ]
+    if branch:
+        rows.append([_btn("🔄 Reset branch to auto", "form:resetbranch")])
+    rows.append([_btn("✅ OK", "form:ok"), _btn("❌ Cancel", "form:cancel")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _refresh_form(context: ContextTypes.DEFAULT_TYPE, form: dict, notice: str = "") -> None:
+    text, markup = _form_view(form, notice)
+    if form.get("msg_id"):
+        await _edit(context.bot, text, markup, chat_id=form["chat_id"], message_id=form["msg_id"])
+    else:
+        msg = await context.bot.send_message(form["chat_id"], text, reply_markup=markup, parse_mode=HTML)
+        form["msg_id"] = msg.message_id
+
+
+def _new_form(chat_id: int, msg_id=None, url: str = "") -> dict:
+    return {"chat_id": chat_id, "msg_id": msg_id, "url": url, "branch": "", "awaiting": None, "prompt_id": None}
+
+
+async def copy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/copy opens the form. A URL after the command pre-fills the URL field."""
+    if not _allowed(update):
+        await update.message.reply_text("⛔ You are not allowed to use this bot.")
+        return
+    prefill = context.args[0] if context.args else ""
+    notice = ""
+    if prefill:
+        try:
+            parse_github_url(prefill)
+        except GitHubError as exc:
+            notice = f"❌ {html.escape(str(exc))}"
+            prefill = ""
+    form = _new_form(update.effective_chat.id, url=prefill)
+    context.user_data[FORM_KEY] = form
+    await _refresh_form(context, form, notice)
+
+
+async def _ask_field(context: ContextTypes.DEFAULT_TYPE, form: dict, field: str) -> None:
+    await _safe_delete(context.bot, form["chat_id"], form.get("prompt_id"))
+    prompts = {
+        "url": ("🔗 Send the GitHub repository URL:", "https://github.com/owner/repo"),
+        "branch": ("🌿 Send the branch name:", "main"),
+    }
+    text, placeholder = prompts[field]
+    msg = await context.bot.send_message(
+        form["chat_id"], text,
+        reply_markup=ForceReply(selective=True, input_field_placeholder=placeholder),
+    )
+    form["awaiting"] = field
+    form["prompt_id"] = msg.message_id
+
+
+async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Receives the value for whichever form field is waiting for input."""
+    if not _allowed(update):
+        return
+    form = context.user_data.get(FORM_KEY)
+    if not form or not form.get("awaiting"):
+        return
+
+    field = form["awaiting"]
+    value = update.message.text.strip()
+    error = ""
+    if field == "url":
+        try:
+            parse_github_url(value)
+        except GitHubError as exc:
+            error = str(exc)
+    elif field == "branch" and not re.fullmatch(r"[\w./-]+", value):
+        error = "Branch names may only contain letters, numbers, . _ - /"
+
+    if error:
+        await update.message.reply_text(
+            f"❌ {error}\nTry again:",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="Send the value again"),
+        )
+        return
+
+    form[field] = value
+    form["awaiting"] = None
+    await _safe_delete(context.bot, form["chat_id"], update.message.message_id)
+    await _safe_delete(context.bot, form["chat_id"], form.get("prompt_id"))
+    form["prompt_id"] = None
+    await _refresh_form(context, form)
+
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the main menu and the form buttons."""
+    query = update.callback_query
+    if not _allowed(update):
+        await query.answer("Not allowed.", show_alert=True)
+        return
+
+    group, action = query.data.split(":", 1)
+
+    if group == "menu":
+        await query.answer()
+        if action == "new":
+            form = _new_form(query.message.chat_id, query.message.message_id)
+            context.user_data[FORM_KEY] = form
+            await _refresh_form(context, form)
+        elif action == "help":
+            await _edit(query, HELP_TEXT, InlineKeyboardMarkup([[_btn("🏠 Menu", "menu:home")]]))
+        else:  # home
+            context.user_data.pop(FORM_KEY, None)
+            await _edit(query, MENU_TEXT, _menu_markup())
+        return
+
+    form = context.user_data.get(FORM_KEY)
+    if not form:
+        await query.answer("Session expired. Send /start.", show_alert=True)
+        return
+
+    if action in ("url", "branch"):
+        await query.answer()
+        await _ask_field(context, form, action)
+    elif action == "resetbranch":
+        form["branch"] = ""
+        await query.answer("Branch reset to auto.")
+        await _refresh_form(context, form)
+    elif action == "cancel":
+        await query.answer()
+        await _safe_delete(context.bot, form["chat_id"], form.get("prompt_id"))
+        context.user_data.pop(FORM_KEY, None)
+        await _edit(query, "🚫 Cancelled.\n\n" + MENU_TEXT, _menu_markup())
+    elif action == "ok":
+        if not form["url"]:
+            await query.answer("Please set the GitHub URL first.", show_alert=True)
+            return
+        await query.answer("Inspecting…")
+        await _safe_delete(context.bot, form["chat_id"], form.get("prompt_id"))
+        form["awaiting"] = None
+        await _edit(query, "🔎 Inspecting repository…")
+        await _run_inspection(update, context, form)
+
+
+async def _run_inspection(update: Update, context: ContextTypes.DEFAULT_TYPE, form: dict) -> None:
+    url = form["url"]
+    if form["branch"]:
+        owner, repo, _ = parse_github_url(url)
+        url = f"https://github.com/{owner}/{repo}/tree/{form['branch']}"
+    try:
+        insp = await asyncio.to_thread(inspect_repository, url)
+    except GitHubError as exc:
+        await _refresh_form(context, form, f"❌ {html.escape(str(exc))}")
+        return
+    except Exception:
+        log.exception("Unexpected error inspecting %s", url)
+        await _refresh_form(context, form, "❌ Unexpected error while inspecting the repository.")
+        return
+
+    if not insp.files:
+        await _refresh_form(context, form, "📭 That repository has no files on this branch.")
+        return
+
+    session = {"inspection": insp, "cwd": insp.start_path, "page": 0, "selected": set(), "view": []}
+    context.user_data[SESSION_KEY] = session
+    context.user_
